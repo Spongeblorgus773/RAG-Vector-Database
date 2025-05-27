@@ -1,10 +1,4 @@
-# D:\YouTubeTranscriptScraper\scripts\NEw_query_rag_database.py
-# GOAL:
-# IF RERANKING: Reliably get scores from the underlying reranker model,
-#               show score stats, then interactively prompt for threshold for the current query.
-#               Filter by this interactive threshold.
-# IF NOT RERANKING: Base retriever fetches a max K, then script filters by similarity score threshold.
-
+# D:\YouTubeTranscriptScraper\scripts\NEw_query_rag_database_refactored.py
 import os
 import sys
 import json
@@ -13,20 +7,18 @@ import traceback
 import argparse
 from datetime import datetime
 from operator import itemgetter
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import requests
-import numpy as np # Import numpy for checking array type
+import numpy as np
 
 # Langchain Imports
 try:
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
-    # ContextualCompressionRetriever is not strictly needed for the primary reranking path now,
-    # but keeping it in case we want to compare or for other compressors later.
     from langchain.retrievers import ContextualCompressionRetriever
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import PromptTemplate
-    from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableConfig
+    from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableConfig, Runnable
     from langchain_core.documents import Document
     from langchain.memory import ConversationBufferMemory
 except ImportError as e:
@@ -37,52 +29,49 @@ except ImportError as e:
 try:
     from langchain.retrievers.document_compressors import CrossEncoderReranker
     from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-    RERANKING_AVAILABLE = True
+    RERANKING_COMPONENT_AVAILABLE = True
 except ImportError:
     print("[Warning] Re-ranking components not found. Re-ranking will be disabled.")
     CrossEncoderReranker = None
     HuggingFaceCrossEncoder = None
-    RERANKING_AVAILABLE = False
+    RERANKING_COMPONENT_AVAILABLE = False
 
 # LLM Import
 try:
-    from langchain_community.llms import Ollama as OllamaLLM
+    from langchain_community.llms import Ollama as OllamaLLM 
 except ImportError:
     try:
-        from langchain_ollama import OllamaLLM
+        from langchain_ollama import OllamaLLM 
     except ImportError:
          print("[Error] Failed to import Ollama LLM. Install 'langchain-community' or 'langchain-ollama'.")
          sys.exit(1)
 
-# --- Script Paths & Basic Config ---
-try:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    SCRIPT_DIR = os.getcwd()
-PROJECT_ROOT_DIR = os.path.dirname(SCRIPT_DIR)
-print(f"[*] Query Script directory: {SCRIPT_DIR}")
-print(f"[*] Query Determined Project root: {PROJECT_ROOT_DIR}")
+# --- Configuration Class ---
+class ScriptConfig:
+    def __init__(self, db_dir_override: Optional[str] = None, output_dir_override: Optional[str] = None):
+        try:
+            self.SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            self.SCRIPT_DIR = os.getcwd()
+        self.PROJECT_ROOT_DIR = os.path.dirname(self.SCRIPT_DIR)
 
-DEFAULT_DB_DIR = "C:\\YouTubeTranscriptScraper\\database\\chroma_db_multi_source"
-DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT_DIR, "output")
-EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+        self.DEFAULT_DB_DIR = db_dir_override or "C:\\YouTubeTranscriptScraper\\database\\chroma_db_multi_source"
+        self.DEFAULT_OUTPUT_DIR = output_dir_override or os.path.join(self.PROJECT_ROOT_DIR, "output")
+        
+        self.EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+        self.DEFAULT_RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-DEFAULT_RERANKER_ENABLED = RERANKING_AVAILABLE
-DEFAULT_RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        self.DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER = 50
+        self.DEFAULT_K_FOR_DIRECT_RETRIEVAL = 20
+        self.DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER = 0.0
+        self.DEFAULT_BASE_SIMILARITY_THRESHOLD = 0.75
 
-DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER = 50
-DEFAULT_K_FOR_DIRECT_RETRIEVAL = 20
-
-DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER = 0.0
-DEFAULT_BASE_SIMILARITY_THRESHOLD = 0.75
-
-AVAILABLE_MODELS = sorted(list(set(
-    ["granite3.3:2b", "phi4-mini-reasoning", "dolphin3:8b","llama3.1:8b",
-    "qwen3:4b", "gemma3:4b"] +
-    ["llama3:latest", "mistral:latest", "codellama:latest", "phi3:latest",
-    "qwen:latest", "gemma:latest"]
-)))
-MEMORY_RAG_PROMPT_TEMPLATE = """
+        self.AVAILABLE_MODELS = sorted(list(set([
+            "llama3:latest", "granite3.3:2b", "phi4-mini-reasoning:latest", 
+            "gemma3:4b", "qwen3:4b", "dolphin3:8b", "llama3.1:8b",
+            "codellama:latest", "mistral:latest", "phi3:latest", "gemma:latest", "qwen:latest"
+        ])))
+        self.MEMORY_RAG_PROMPT_TEMPLATE_STR = """
 <|begin_of_text|>
 <|start_header_id|>system<|end_header_id|>
 You are a helpful assistant. Answer the current 'QUESTION' based ONLY on the provided 'CONTEXT' (which may contain info from YouTube, CISA, PDFs etc.) and the 'CHAT HISTORY'.
@@ -102,615 +91,477 @@ QUESTION: {question}
 <|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>
 """
-OUTPUT_FILE_PREFIX = "rag_chat_session"
-DEFAULT_MAX_TOKENS = 1024
-EXIT_KEYWORDS = {"end", "stop", "quit", "bye", "exit"}
-COMMAND_KEYWORDS = {"/set_tokens", "/help", "/mode", "/showchunks", "/set_rerank_threshold", "/set_base_threshold"}
-DEFAULT_SESSION_MODE = "rag"
-DEFAULT_SHOW_CHUNKS = True
-# --- End Basic Config ---
+        self.OUTPUT_FILE_PREFIX = "rag_chat_session"
+        self.DEFAULT_MAX_TOKENS = 1024
+        self.EXIT_KEYWORDS = {"end", "stop", "quit", "bye", "exit"}
+        self.DEFAULT_SESSION_MODE = "rag" 
+        self.DEFAULT_SHOW_CHUNKS = True
+        self.RERANKER_INITIALLY_ENABLED_BY_USER = RERANKING_COMPONENT_AVAILABLE
+
+        print(f"[*] Config: Script directory: {self.SCRIPT_DIR}")
+        print(f"[*] Config: Project root: {self.PROJECT_ROOT_DIR}")
+        print(f"[*] Config: DB directory: {self.DEFAULT_DB_DIR}")
+        print(f"[*] Config: Output directory: {self.DEFAULT_OUTPUT_DIR}")
+
+# --- Session State Class ---
+class SessionState:
+    def __init__(self, config: ScriptConfig):
+        self.config = config
+        self.mode: str = config.DEFAULT_SESSION_MODE
+        self.show_chunks_in_terminal: bool = config.DEFAULT_SHOW_CHUNKS
+        self.selected_llm_name: Optional[str] = None
+        self.llm_instance: Optional[OllamaLLM] = None
+        self.max_tokens: int = config.DEFAULT_MAX_TOKENS
+        
+        self.reranker_active_for_session: bool = config.RERANKER_INITIALLY_ENABLED_BY_USER and RERANKING_COMPONENT_AVAILABLE
+        self.k_initial_retrieval: int = config.DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER if self.reranker_active_for_session else config.DEFAULT_K_FOR_DIRECT_RETRIEVAL
+        
+        self.reranker_score_threshold_session_default: float = config.DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER
+        self.base_similarity_threshold_session_default: float = config.DEFAULT_BASE_SIMILARITY_THRESHOLD
+
+        self.memory = ConversationBufferMemory(memory_key="history", input_key="question", output_key="ai_response", return_messages=False)
+        self.rag_chain_template: Optional[PromptTemplate] = PromptTemplate(
+            input_variables=["history", "context", "question"],
+            template=config.MEMORY_RAG_PROMPT_TEMPLATE_STR
+        )
+        self.follow_up_chain_template: Optional[PromptTemplate] = self.rag_chain_template
+        
+        self.rag_runnable: Optional[Runnable] = None
+        self.follow_up_runnable: Optional[Runnable] = None
+
+        self.last_retrieved_docs_for_follow_up: Optional[List[Document]] = None
+        self.conversation_log: List[Dict[str, Any]] = []
+        self.turn_count: int = 0
 
 # --- Helper Functions ---
-def get_device():
+def get_device_info() -> str:
     if torch.cuda.is_available():
-        try: _ = torch.tensor([1.0]).to('cuda'); return "cuda"
-        except Exception as e: print(f"[Warning] CUDA init failed: {e}. CPU fallback."); return "cpu"
+        try:
+            _ = torch.tensor([1.0]).to('cuda')
+            print(f"[*] CUDA GPU found: {torch.cuda.get_device_name(0)}")
+            return "cuda"
+        except Exception as e:
+            print(f"[Warning] CUDA initialization failed: {e}. Falling back to CPU.")
+            return "cpu"
+    print("[*] No compatible GPU detected. Using CPU.")
     return "cpu"
 
-def initialize_embeddings(device_to_use):
-    print(f"[*] Embeddings: '{EMBEDDING_MODEL_NAME}' on '{device_to_use}'...")
-    try:
-        embed_func = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': device_to_use}, encode_kwargs={'normalize_embeddings': True}, show_progress=False)
-        _ = embed_func.embed_query("test"); print("[*] Embeddings loaded."); return embed_func
-    except Exception as e: print(f"[ERROR] Embeddings init: {e}"); traceback.print_exc(); sys.exit(1)
-
-def initialize_db(db_dir, embed_func):
-    print(f"[*] ChromaDB from: '{db_dir}'")
-    if not os.path.isdir(db_dir): print(f"[Error] DB dir not found: {db_dir}"); sys.exit(1)
-    try:
-        vector_db = Chroma(persist_directory=db_dir, embedding_function=embed_func)
-        print(f"[*] DB Connected. Docs: {vector_db._collection.count()}")
-        return vector_db
-    except Exception as e: print(f"[ERROR] DB init: {e}"); traceback.print_exc(); sys.exit(1)
-
-def format_docs_for_llm(docs: List[Document]) -> str:
-    if not docs: return "No relevant documents found."
-    formatted = []
-    for i, doc in enumerate(docs):
-        content = doc.page_content; metadata = doc.metadata
-        score = metadata.get('final_score_used_for_filtering')
-        score_info = f" (Score: {score:.4f})" if score is not None else ""
-        title = metadata.get('title') or metadata.get('vulnerabilityName') or metadata.get('pdf_title') or metadata.get('filename', 'N/A')
-        source_type = metadata.get('source_type', 'Unknown')
-        chunk_num = metadata.get('chunk_number', '?')
-        identifier = f" (CVE: {metadata.get('cveID')})" if metadata.get('cveID') else f" (Video: {metadata.get('video_id')})" if metadata.get('video_id') else ""
-        formatted.append(f"--- Context Chunk {i+1} (Source: {source_type}{identifier}, Title: '{title}', Chunk: {chunk_num}){score_info} ---\n{content}")
-    return "\n\n".join(formatted)
-
-def check_ollama_connection(model_name=""):
+def check_ollama_connection(model_to_verify: Optional[str] = None) -> bool:
     try:
         import ollama
-        client = ollama.Client()
-        models_info = client.list().get('models', [])
-        if not isinstance(models_info, list):
-            print("[Warning] Unexpected response format from Ollama list. Proceeding cautiously.")
-            return True
-        if model_name:
-            if not any(m.get('name','').startswith(model_name.split(':')[0]) for m in models_info):
-                print(f"[Error] Ollama model '{model_name}' not found. Pull it first, e.g., 'ollama pull {model_name}'."); return False
-        return True
-    except ImportError: print("[Error] 'ollama' Python library not found. Install with 'pip install ollama'."); return False
-    except requests.exceptions.ConnectionError: print("[Error] Ollama server connection failed. Ensure Ollama is running."); return False
-    except Exception as e: print(f"[Error] Ollama check encountered an issue: {type(e).__name__} - {e}"); return False
+        client = ollama.Client() # Defaults should be fine since OLLAMA_HOST is not set by user for script
 
-def display_retrieved_docs(query, docs, info_str):
-    print(f"\n--- {len(docs)} Retrieved Docs for '{query}' ({info_str}) ---")
-    if not docs: print("--- No documents. ---"); return
+        if model_to_verify:
+            print(f"\n[Debug] Verifying specific model '{model_to_verify}' with Ollama server...")
+            try:
+                client.show(model_to_verify) 
+                print(f"[*] Ollama server acknowledged model '{model_to_verify}'. Connection and model seem OK.")
+                return True
+            except ollama.ResponseError as e: 
+                 if e.status_code == 404:
+                    print(f"[Error] Ollama server reports model '{model_to_verify}' not found (404).")
+                 else:
+                    print(f"[Error] Ollama API error when checking model '{model_to_verify}': Status {e.status_code} - {e.error}")
+                 return False
+            except requests.exceptions.ConnectionError:
+                print(f"[Error] Ollama server connection failed when verifying model '{model_to_verify}'.")
+                return False
+            except Exception as e_show:
+                print(f"[Error] Unexpected issue verifying model '{model_to_verify}' with Ollama: {type(e_show).__name__} - {e_show}")
+                return False
+        else: # Basic connectivity check
+            try:
+                client.list() # Just try to list, don't need to parse here anymore
+                print("[*] Ollama connection successful (basic list command acknowledged).")
+                return True
+            except requests.exceptions.ConnectionError:
+                print(f"[Error] Ollama server connection failed (basic list command).")
+                return False
+            except Exception as e_list:
+                print(f"[Error] Issue during basic Ollama list command for connectivity check: {type(e_list).__name__} - {e_list}")
+                return False
+    except ImportError:
+        print("[Error] Python 'ollama' library not found. Install with 'pip install ollama'.")
+        return False
+    except Exception as e_conn_general: 
+        print(f"[Error] Ollama connection check encountered an unexpected issue: {type(e_conn_general).__name__} - {e_conn_general}")
+        traceback.print_exc()
+        return False
+
+def display_retrieved_docs(query: str, docs: List[Document], info_str: str, show_snippets: bool = True):
+    print(f"\n--- {len(docs)} Retrieved Docs for Query: '{query}' ---")
+    print(f"    Retrieval Info: {info_str}")
+    if not docs: print("--- No documents found matching criteria. ---"); return
     for i, doc in enumerate(docs):
-        metadata = doc.metadata; content = doc.page_content
-        # Try to get any available score, prioritizing the one used for filtering
-        score = metadata.get('final_score_used_for_filtering', metadata.get('relevance_score', metadata.get('similarity_score')))
-        score_info = f"Score: {score:.4f} | " if score is not None else ""
-        title = metadata.get('title') or metadata.get('vulnerabilityName') or metadata.get('pdf_title') or metadata.get('filename', 'N/A')
-        source_type = metadata.get('source_type', 'Unknown')
-        chunk_num = metadata.get('chunk_number', '?')
-        doc_id_display = metadata.get('id_for_log') or \
-                         metadata.get('video_id') or \
-                         metadata.get('cveID') or \
-                         metadata.get('id', f'doc_idx_{i}')
-
-        identifier = f" (ID: {doc_id_display})" # Simplified identifier for display
-        print(f"[{i+1}] {score_info}Source: {source_type}{identifier} | Title: '{title}' | Chunk: {chunk_num}")
-        print(f"    Snippet: {content[:250].replace(chr(10), ' ')}...")
+        meta = doc.metadata; content = doc.page_content
+        score_info = f"Score: {meta.get('final_score_used_for_filtering'):.4f} | " if meta.get('final_score_used_for_filtering') is not None else ""
+        title = meta.get('title', meta.get('vulnerabilityName', meta.get('pdf_title', meta.get('filename', 'N/A'))))
+        src = meta.get('source_type', 'Unknown'); chunk_idx = meta.get('chunk_number', meta.get('chunk_index', '?'))
+        doc_id = meta.get('id_for_log', meta.get('id', f'doc_idx_{i}')); id_info = f"(ID: {doc_id})"
+        print(f"[{i+1}] {score_info}Source: {src}{id_info} | Title: '{title}' | Chunk: {chunk_idx}")
+        if show_snippets: print(f"    Snippet: {content[:250].replace(chr(10), ' ').strip()}{'...' if len(content)>250 else ''}")
     print("-" * 80)
 
-def initialize_llm(model_name, num_tokens):
-    print(f"\n[*] LLM: '{model_name}', max_tokens={num_tokens}...")
+def save_chat_log(session_state: SessionState, rag_manager: 'RAGManager', config: ScriptConfig):
+    if not session_state.conversation_log: print("\n[*] No turns to log."); return
     try:
-        llm = OllamaLLM(model=model_name, num_predict=num_tokens)
-        llm.invoke("Test: 1+1 is?"); print("[*] LLM initialized."); return llm
-    except Exception as e: print(f"[ERROR] LLM init: {e}"); return None
-# --- END Helper Functions ---
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(config.DEFAULT_OUTPUT_DIR, f"{config.OUTPUT_FILE_PREFIX}_{ts}.json")
+        summary = {
+            "timestamp": ts, "mode": session_state.mode,
+            "llm": session_state.selected_llm_name if session_state.mode == "rag" else "N/A",
+            "max_tokens": session_state.max_tokens if session_state.mode == "rag" else "N/A",
+            "reranker_avail": RERANKING_COMPONENT_AVAILABLE, "reranker_active": session_state.reranker_active_for_session,
+            "reranker_model": config.DEFAULT_RERANKER_MODEL_NAME if session_state.reranker_active_for_session else "N/A",
+            "k_initial": session_state.k_initial_retrieval,
+            "rerank_thresh_default": session_state.reranker_score_threshold_session_default if session_state.reranker_active_for_session else "N/A",
+            "base_sim_thresh_default": session_state.base_similarity_threshold_session_default if not session_state.reranker_active_for_session else "N/A",
+            "embed_model": config.EMBEDDING_MODEL_NAME, "embed_device": rag_manager.device if rag_manager else "N/A",
+            "db_path": os.path.abspath(config.DEFAULT_DB_DIR), "show_chunks": session_state.show_chunks_in_terminal,
+            "total_turns": len(session_state.conversation_log)
+        }
+        full_log = {"session_summary": summary, "conversation_turns": session_state.conversation_log}
+        os.makedirs(config.DEFAULT_OUTPUT_DIR, exist_ok=True)
+        print(f"\n[*] Saving log to: {log_file}...")
+        with open(log_file, 'w', encoding='utf-8') as f: json.dump(full_log, f, indent=4, default=str) 
+        print(f"[*] Log saved.")
+    except Exception as e: print(f"\n[Error] Saving log: {e}"); traceback.print_exc()
 
-# --- Centralized Document Fetching and Filtering Function ---
-def get_final_documents_for_turn(
-    query_text: str,
-    db: Chroma,
-    is_reranking_active_now: bool,
-    k_to_fetch_initially: int,
-    reranker_obj: Optional[CrossEncoderReranker],
-    base_score_thresh: float, # Session default for base similarity
-    rerank_score_thresh: float # Session default for reranker, used as default for interactive prompt
-    ) -> Tuple[List[Document], str]:
+# --- RAG Manager Class ---
+class RAGManager:
+    def __init__(self, config: ScriptConfig, session_state: SessionState):
+        self.config = config; self.session_state = session_state; self.device = get_device_info()
+        self.embedding_function = self._initialize_embeddings(); self.vector_db = self._initialize_db()
+        self.reranker_instance: Optional[CrossEncoderReranker] = None
+        if self.session_state.reranker_active_for_session: self._initialize_reranker() 
+        if self.session_state.mode == "rag" and self.session_state.selected_llm_name: self._initialize_llm_and_chains()
 
-    final_documents: List[Document] = []
-    info_string = ""
-    docs_with_scores_to_filter: List[Document] = []
-
-    if is_reranking_active_now and reranker_obj and reranker_obj.model:
-        base_retriever = db.as_retriever(search_kwargs={"k": k_to_fetch_initially})
+    def _initialize_embeddings(self) -> HuggingFaceEmbeddings:
+        print(f"[*] Embeddings: '{self.config.EMBEDDING_MODEL_NAME}' on '{self.device}'...")
         try:
-            initial_docs_from_db = base_retriever.invoke(query_text) # Updated to .invoke()
-        except Exception as e_invoke:
-            print(f"DEBUG: Error during base_retriever.invoke(): {e_invoke}")
-            traceback.print_exc()
-            initial_docs_from_db = []
+            func = HuggingFaceEmbeddings(model_name=self.config.EMBEDDING_MODEL_NAME, model_kwargs={'device': self.device}, encode_kwargs={'normalize_embeddings': True}, show_progress=False)
+            _ = func.embed_query("Test."); print("[*] Embeddings loaded."); return func
+        except Exception as e: print(f"[Error] Embeddings init: {e}"); traceback.print_exc(); sys.exit(1)
 
-        count_from_initial_retrieval = len(initial_docs_from_db)
-        print(f"\nDEBUG: Retrieved {count_from_initial_retrieval} initial documents from DB using retriever.invoke().")
+    def _initialize_db(self) -> Chroma:
+        print(f"[*] ChromaDB from: '{self.config.DEFAULT_DB_DIR}'")
+        if not os.path.isdir(self.config.DEFAULT_DB_DIR): print(f"[Error] DB dir not found: {self.config.DEFAULT_DB_DIR}"); sys.exit(1)
+        try:
+            db = Chroma(persist_directory=self.config.DEFAULT_DB_DIR, embedding_function=self.embedding_function)
+            print(f"[*] ChromaDB connected. Docs: {db._collection.count()}"); return db
+        except Exception as e: print(f"[Error] DB init: {e}"); traceback.print_exc(); sys.exit(1)
 
-        raw_scores_list = [] # Will store float scores or None
-
-        if initial_docs_from_db:
-            print(f"DEBUG: Preparing to call reranker_obj.model.score() directly.")
-            sentence_pairs = [(query_text, doc.page_content) for doc in initial_docs_from_db]
+    def _initialize_reranker(self):
+        if not (RERANKING_COMPONENT_AVAILABLE and CrossEncoderReranker and HuggingFaceCrossEncoder):
+            print("[Info] Re-ranking components N/A. Disabling for session."); self.session_state.reranker_active_for_session = False; self.reranker_instance = None; return
+        print(f"[*] Reranker: '{self.config.DEFAULT_RERANKER_MODEL_NAME}' on '{self.device}'...")
+        try:
+            encoder = HuggingFaceCrossEncoder(model_name=self.config.DEFAULT_RERANKER_MODEL_NAME, model_kwargs={'device': self.device})
+            self.reranker_instance = CrossEncoderReranker(model=encoder, top_n=self.session_state.k_initial_retrieval)
+            print("[*] Reranker instance created.")
+        except Exception as e: print(f"[Error] Reranker init: {e}"); traceback.print_exc(); print("[Warning] Proceeding without re-ranking."); self.session_state.reranker_active_for_session = False; self.reranker_instance = None
             
-            try:
-                if sentence_pairs:
-                    print(f"DEBUG: Calling reranker_obj.model.score() with {len(sentence_pairs)} pairs.")
-                    raw_scores_from_model = reranker_obj.model.score(sentence_pairs)
-                    # print(f"DEBUG: Raw scores from reranker_obj.model.score() (first 10): {raw_scores_from_model[:10]}")
-                    
-                    if raw_scores_from_model is not None:
-                        processed_scores_temp = []
-                        if isinstance(raw_scores_from_model, np.ndarray):
-                            processed_scores_temp = raw_scores_from_model.tolist()
-                        elif isinstance(raw_scores_from_model, list):
-                            processed_scores_temp = raw_scores_from_model
-                        else:
-                            print(f"DEBUG: raw_scores_from_model is of unexpected type: {type(raw_scores_from_model)}. Attempting to process.")
-                            try: processed_scores_temp = list(raw_scores_from_model)
-                            except TypeError: processed_scores_temp = []
+    def _initialize_llm_and_chains(self):
+        if not self.session_state.selected_llm_name:
+            print("[Warning] No LLM selected. Cannot init RAG chains."); self.session_state.llm_instance=None; self.session_state.rag_runnable=None; self.session_state.follow_up_runnable=None; return
+        print(f"\n[*] Init Ollama LLM: '{self.session_state.selected_llm_name}', max_tokens={self.session_state.max_tokens}...")
+        try:
+            # REMOVED explicit host parameter. OllamaLLM will use OLLAMA_HOST env var or default.
+            llm = OllamaLLM(model=self.session_state.selected_llm_name, num_predict=self.session_state.max_tokens)
+            _ = llm.invoke("1+1?")
+            print(f"[*] LLM initialized & tested."); self.session_state.llm_instance = llm
+        except Exception as e:
+            print(f"[Error] LLM init '{self.session_state.selected_llm_name}': {e}"); traceback.print_exc()
+            self.session_state.llm_instance=None; self.session_state.rag_runnable=None; self.session_state.follow_up_runnable=None; return
 
-                        if len(processed_scores_temp) == len(initial_docs_from_db):
-                            for s_idx, s_val in enumerate(processed_scores_temp):
-                                try: raw_scores_list.append(float(s_val))
-                                except (ValueError, TypeError):
-                                    # print(f"DEBUG: Could not convert score {s_val} at index {s_idx} to float. Setting to None.")
-                                    raw_scores_list.append(None) # Store None if conversion fails
-                        else:
-                            print(f"DEBUG: Mismatch in length between scores ({len(processed_scores_temp)}) and documents ({len(initial_docs_from_db)}). No scores will be used from this batch.")
-                    else:
-                        print("DEBUG: raw_scores_from_model is None.")
-                else:
-                    print("DEBUG: No sentence pairs to score.")
-            except Exception as e_score:
-                print(f"DEBUG: Error during reranker_obj.model.score(): {e_score}")
-                traceback.print_exc()
+        # This runnable expects 'docs_for_context' in the input dictionary, not 'question' for doc retrieval
+        self.session_state.rag_runnable = (
+            RunnablePassthrough.assign(
+                context=RunnableLambda(lambda x: self.format_docs_for_llm(x.get("docs_for_context", []))), 
+                history=RunnableLambda(lambda x: self.session_state.memory.load_memory_variables({"question": x.get("question", "")}).get("history", ""))
+            ) | self.session_state.rag_chain_template | self.session_state.llm_instance | StrOutputParser()
+        )
+        print("[*] Main RAG chain (re-)created.")
+        self.session_state.follow_up_runnable = (
+            RunnablePassthrough.assign(history=RunnableLambda(lambda x: self.session_state.memory.load_memory_variables({"question": x.get("question", "")}).get("history", ""))) |
+            self.session_state.follow_up_chain_template | self.session_state.llm_instance | StrOutputParser()
+        )
+        print("[*] Follow-up RAG chain (re-)created.")
+
+    def format_docs_for_llm(self, docs: List[Document]) -> str:
+        if not docs: return "No relevant documents found."
+        chunks = []
+        for i, doc in enumerate(docs):
+            meta = doc.metadata; content = doc.page_content
+            score_info = f" (Score: {meta.get('final_score_used_for_filtering'):.4f})" if meta.get('final_score_used_for_filtering') is not None else ""
+            title = meta.get('title', meta.get('vulnerabilityName', meta.get('pdf_title', meta.get('filename', 'N/A'))))
+            src = meta.get('source_type', 'Unknown'); chunk_idx = meta.get('chunk_number', meta.get('chunk_index', '?'))
+            id_parts = [f"CVE:{meta['cveID']}" if meta.get('cveID') else None, f"Video:{meta['video_id']}" if meta.get('video_id') else None]
+            id_str = ", ".join(filter(None, id_parts)); id_info = f" ({id_str})" if id_str else ""
+            chunks.append(f"--- Context Chunk {i+1} (Source: {src}{id_info}, Title: '{title}', Chunk: {chunk_idx}){score_info} ---\n{content}")
+        return "\n\n".join(chunks)
+
+    def get_final_documents_for_turn(self, query_text: str) -> Tuple[List[Document], str]:
+        final_docs, info_str = [], "N/A"; k = self.session_state.k_initial_retrieval
+        if self.session_state.reranker_active_for_session and self.reranker_instance and self.reranker_instance.model:
+            retriever = self.vector_db.as_retriever(search_kwargs={"k": k})
+            initial_db_docs: List[Document] = []; actual_retrieved_count = 0
+            try: initial_db_docs = retriever.invoke(query_text); actual_retrieved_count = len(initial_db_docs)
+            except Exception as e: print(f"[Error] Initial retrieval: {e}"); traceback.print_exc()
             
-            # Attach scores to documents
-            if raw_scores_list and len(raw_scores_list) == len(initial_docs_from_db):
-                print("DEBUG: Attaching manually obtained raw_scores to documents.")
-                for i, doc_original in enumerate(initial_docs_from_db):
-                    # Create a new Document object to avoid modifying cached objects from retriever
-                    new_doc = Document(page_content=doc_original.page_content, metadata=doc_original.metadata.copy())
-                    new_doc.metadata['relevance_score'] = raw_scores_list[i]
-                    # Try to get a persistent ID for logging
-                    new_doc.metadata['id_for_log'] = new_doc.metadata.get('id') or \
-                                                   new_doc.metadata.get('video_id') or \
-                                                   new_doc.metadata.get('cveID') or \
-                                                   f'orig_idx_{i}'
-                    docs_with_scores_to_filter.append(new_doc)
-            else:
-                print("DEBUG: No usable scores obtained from direct model call. Reranking scores will not be applied for filtering.")
-                # Fallback: use initial documents, but they won't have 'relevance_score' for this path
-                docs_with_scores_to_filter = [Document(page_content=d.page_content, metadata=d.metadata.copy()) for d in initial_docs_from_db]
-        else: 
-            print("DEBUG: No initial documents from DB to rerank.")
-
-        # --- NEW: Interactive Threshold Input ---
-        actual_threshold_for_this_query = rerank_score_thresh # Default to session threshold
-
-        valid_scores_for_stats = [doc.metadata['relevance_score'] for doc in docs_with_scores_to_filter if doc.metadata.get('relevance_score') is not None]
-
-        if valid_scores_for_stats:
-            min_s, max_s, avg_s = min(valid_scores_for_stats), max(valid_scores_for_stats), sum(valid_scores_for_stats)/len(valid_scores_for_stats)
-            print(f"\n--- Score Stats for Current Query ---")
-            print(f"Scores for {len(valid_scores_for_stats)} docs range from: {min_s:.4f} to {max_s:.4f} (Avg: {avg_s:.4f})")
-            print(f"Highest score observed: {max_s:.4f}")
-            
-            while True:
-                try:
-                    threshold_input_str = input(f"Enter threshold for this query (session default: {rerank_score_thresh:.2f}, press Enter to use default): ").strip()
-                    if not threshold_input_str:
-                        actual_threshold_for_this_query = rerank_score_thresh
-                        print(f"Using session default threshold: {actual_threshold_for_this_query:.2f}")
-                    else:
-                        actual_threshold_for_this_query = float(threshold_input_str)
-                        print(f"Using threshold for this query: {actual_threshold_for_this_query:.2f}")
-                    break 
-                except ValueError:
-                    print("Invalid input. Please enter a number or press Enter for default.")
-        elif docs_with_scores_to_filter: 
-             print("\nWARNING: No valid 'relevance_score' found in document metadata. Cannot apply score-based thresholding for this query using reranker scores.")
-        else: 
-            print("\nINFO: No documents were retrieved or scored to apply a threshold.")
-
-        # Filter documents using the determined threshold for this query
-        for doc_idx, doc in enumerate(docs_with_scores_to_filter):
-            score = doc.metadata.get('relevance_score') 
-            doc_id_for_log = doc.metadata.get('id_for_log', f'processed_idx_{doc_idx}')
-
-            if score is not None and score >= actual_threshold_for_this_query:
-                doc.metadata['final_score_used_for_filtering'] = score
-                final_documents.append(doc)
-            elif score is None and is_reranking_active_now and any(d.metadata.get('relevance_score') is not None for d in docs_with_scores_to_filter): # Only log if some docs had scores
-                 print(f"  [Filter-Info] Doc ID '{doc_id_for_log}' had a None score or was not processed for scoring. Metadata: {doc.metadata}. Skipping.")
-        
-        info_string = (f"Reranked (Interactive Threshold): Initial DB k={k_to_fetch_initially} ({count_from_initial_retrieval} actual), "
-                       f"{len(docs_with_scores_to_filter)} docs considered, "
-                       f"Thresholded (score >= {actual_threshold_for_this_query:.2f}) to {len(final_documents)}")
-    else: 
-        docs_with_sim_scores = db.similarity_search_with_relevance_scores(query_text, k=k_to_fetch_initially)
-        count_from_base_retrieval = len(docs_with_sim_scores)
-        for doc, score in docs_with_sim_scores:
-            if score >= base_score_thresh:
-                doc.metadata['similarity_score'] = score
-                doc.metadata['final_score_used_for_filtering'] = score
-                final_documents.append(doc)
-        info_string = (f"Direct: Max k={k_to_fetch_initially}, "
-                       f"{count_from_base_retrieval} retrieved with scores, "
-                       f"Thresholded (score >= {base_score_thresh:.2f}) to {len(final_documents)}")
-    
-    return final_documents, info_string
-
-# --- Main Execution Block ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RAG Chat Application")
-    parser.add_argument("--db_dir", default=DEFAULT_DB_DIR)
-    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
-    args = parser.parse_args()
-
-    DB_DIR = args.db_dir
-    OUTPUT_DIR = args.output_dir
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    if not check_ollama_connection(): sys.exit(1)
-    embed_device = get_device()
-    embedding_function = initialize_embeddings(embed_device)
-    vector_db: Chroma = initialize_db(DB_DIR, embedding_function)
-
-    session_mode = DEFAULT_SESSION_MODE
-    show_chunks_in_terminal = DEFAULT_SHOW_CHUNKS
-    selected_model_name = None; llm = None; max_tokens_value = DEFAULT_MAX_TOKENS
-
-    # These will store the SESSION DEFAULTS for thresholds
-    param_reranker_score_threshold_session_default = DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER
-    param_base_similarity_threshold_session_default = DEFAULT_BASE_SIMILARITY_THRESHOLD
-    
-    # param_k_initial_retrieval will be set based on reranker status
-    param_k_initial_retrieval = DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER if DEFAULT_RERANKER_ENABLED else DEFAULT_K_FOR_DIRECT_RETRIEVAL
-
-
-    _choice = input(f"Mode (1. RAG, 2. Retrieval Only, Enter='{DEFAULT_SESSION_MODE}'): ").strip()
-    session_mode = {"1": "rag", "2": "retrieval_only"}.get(_choice, DEFAULT_SESSION_MODE)
-    print(f"[*] Mode: {session_mode.replace('_',' ').title()}")
-
-    _choice = input(f"Show chunks in terminal? (Y/n, Enter={'Y' if DEFAULT_SHOW_CHUNKS else 'N'}): ").strip().lower()
-    show_chunks_in_terminal = not (_choice == 'n')
-    print(f"[*] Show chunks: {'ON' if show_chunks_in_terminal else 'OFF'}")
-
-    if session_mode == "rag":
-        print("\n--- Select LLM Model ---")
-        default_llm_display = AVAILABLE_MODELS[0] if AVAILABLE_MODELS else 'None (no models configured)'
-        for i, name in enumerate(AVAILABLE_MODELS): print(f"  {i+1}. {name}")
-        while True:
-            try:
-                _choice = input(f"Choose LLM (1-{len(AVAILABLE_MODELS)} or type name, Enter for '{default_llm_display}'): ").strip()
-                temp_name = ""
-                if not _choice and AVAILABLE_MODELS:
-                    temp_name = AVAILABLE_MODELS[0] 
-                    print(f"Defaulting to {temp_name}")
-                elif _choice.isdigit():
-                    model_index = int(_choice)-1
-                    if 0 <= model_index < len(AVAILABLE_MODELS):
-                        temp_name = AVAILABLE_MODELS[model_index]
-                    else: print("Invalid choice number."); continue
-                elif _choice: temp_name = _choice
+            scored_filter_docs: List[Document] = []
+            if initial_db_docs:
+                pairs = [(query_text, d.page_content) for d in initial_db_docs]; scores_raw: Any = None
+                try: 
+                    if pairs: scores_raw = self.reranker_instance.model.score(pairs)
+                except Exception as e: print(f"[Error] Reranker scoring: {e}"); traceback.print_exc()
+                scores_list = []
+                if scores_raw is not None:
+                    if isinstance(scores_raw, np.ndarray): scores_list = scores_raw.tolist()
+                    elif isinstance(scores_raw, list): scores_list = scores_raw
+                    else: 
+                        try: scores_list = list(scores_raw)
+                        except TypeError: print(f"[Warning] Reranker scores type {type(scores_raw)} not list-convertible.")
+                if len(scores_list) == actual_retrieved_count:
+                    for i, od in enumerate(initial_db_docs):
+                        nd = Document(page_content=od.page_content, metadata=od.metadata.copy())
+                        try: nd.metadata['relevance_score'] = float(scores_list[i])
+                        except (ValueError, TypeError): nd.metadata['relevance_score'] = None
+                        nd.metadata['id_for_log'] = nd.metadata.get('id', f'db_idx_{i}'); scored_filter_docs.append(nd)
                 else: 
-                    if not AVAILABLE_MODELS: print("No models configured. Cannot proceed in RAG mode without an LLM."); sys.exit(1)
-                    print("No input. Please select a model or type a name."); continue
-
-                if temp_name and check_ollama_connection(temp_name):
-                    selected_model_name = temp_name; break 
-                elif not temp_name and not AVAILABLE_MODELS: 
-                     print("No models available to default to and no input given.")
-                     continue
-            except (ValueError, IndexError): print("Invalid selection. Please try again.")
-
-        print(f"[*] Using LLM: {selected_model_name}")
-        while True:
-            try:
-                _input_str = input(f"Max LLM response tokens? (Enter for default={DEFAULT_MAX_TOKENS}): ").strip()
-                if not _input_str: max_tokens_value = DEFAULT_MAX_TOKENS; break
-                max_tokens_value = int(_input_str)
-                if max_tokens_value > 50: break
-                else: print("Please enter a value greater than 50.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        llm = initialize_llm(selected_model_name, max_tokens_value)
-        if not llm: print("[Warning] LLM initialization failed, RAG mode may be impaired.")
-
-    print("\n--- Configure Retrieval ---")
-    if RERANKING_AVAILABLE:
-        _choice = input(f"Enable Re-ranking? (Y/n, Enter={'Y' if DEFAULT_RERANKER_ENABLED else 'N'}): ").strip().lower()
-        reranker_active_for_session = not (_choice == 'n')
-    else:
-        print("[Info] Re-ranking components unavailable. Re-ranking is DISABLED.")
-        reranker_active_for_session = False
-
-    reranker_model_instance = None 
-    if reranker_active_for_session:
-        print("Re-ranking is ON.")
-        try:
-            _input_str = input(f"Initial candidates for DB fetch (k)? (Default={DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER}): ").strip()
-            param_k_initial_retrieval = int(_input_str) if _input_str else DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER
-            if param_k_initial_retrieval <= 0: param_k_initial_retrieval = DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER
-        except ValueError: param_k_initial_retrieval = DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER
-
-        try:
-            # This sets the SESSION DEFAULT threshold
-            _input_str = input(f"Re-ranker score threshold (SESSION DEFAULT, e.g., -5.0 to 10.0. Default={DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER}): ").strip()
-            param_reranker_score_threshold_session_default = float(_input_str) if _input_str else DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER
-        except ValueError: param_reranker_score_threshold_session_default = DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER
-        print(f"[*] Reranker: Will fetch {param_k_initial_retrieval} initial candidates from DB. SESSION DEFAULT threshold for scores >= {param_reranker_score_threshold_session_default:.2f}")
-        
-        if RERANKING_AVAILABLE and CrossEncoderReranker and HuggingFaceCrossEncoder: 
-            print(f"[*] Initializing Re-ranker model: '{DEFAULT_RERANKER_MODEL_NAME}'...")
-            try:
-                encoder = HuggingFaceCrossEncoder(model_name=DEFAULT_RERANKER_MODEL_NAME, model_kwargs={'device': embed_device})
-                # top_n for CrossEncoderReranker is how many docs it passes through if used as a compressor.
-                # Since we call model.score() directly, this top_n isn't directly used in our primary path,
-                # but good to set it consistently.
-                reranker_model_instance = CrossEncoderReranker(model=encoder, top_n=param_k_initial_retrieval) 
-                print(f"[*] Re-ranker model instance created (its 'top_n' is set to {param_k_initial_retrieval}).")
-            except Exception as e:
-                print(f"[Error] Re-ranker init failed: {e}"); traceback.print_exc()
-                reranker_active_for_session = False 
-                reranker_model_instance = None
-        else: 
-            print("[Error] Reranking was enabled, but necessary components are not available. Disabling reranking.")
-            reranker_active_for_session = False
-            reranker_model_instance = None
-    else: 
-        print("Re-ranking is OFF. Direct retrieval from vector store.")
-        param_k_initial_retrieval = DEFAULT_K_FOR_DIRECT_RETRIEVAL # Set k for direct retrieval
-        try:
-            _input_str = input(f"Max documents to retrieve (before similarity threshold, Default={DEFAULT_K_FOR_DIRECT_RETRIEVAL}): ").strip()
-            param_k_initial_retrieval = int(_input_str) if _input_str else DEFAULT_K_FOR_DIRECT_RETRIEVAL
-            if param_k_initial_retrieval <=0: param_k_initial_retrieval = DEFAULT_K_FOR_DIRECT_RETRIEVAL
-        except ValueError: param_k_initial_retrieval = DEFAULT_K_FOR_DIRECT_RETRIEVAL
-
-        try:
-            _input_str = input(f"Similarity score threshold (SESSION DEFAULT, 0-1, higher is better, Default={DEFAULT_BASE_SIMILARITY_THRESHOLD}): ").strip()
-            param_base_similarity_threshold_session_default = float(_input_str) if _input_str else DEFAULT_BASE_SIMILARITY_THRESHOLD
-            if not (0.0 <= param_base_similarity_threshold_session_default <= 1.0): param_base_similarity_threshold_session_default = DEFAULT_BASE_SIMILARITY_THRESHOLD
-        except ValueError: param_base_similarity_threshold_session_default = DEFAULT_BASE_SIMILARITY_THRESHOLD
-        print(f"[*] Direct Retrieval: Max k={param_k_initial_retrieval}, SESSION DEFAULT Threshold >={param_base_similarity_threshold_session_default:.2f}")
+                    print(f"[Warning] Score/doc mismatch ({len(scores_list)} vs {actual_retrieved_count}). No reranker scores applied."); 
+                    scored_filter_docs = [Document(page_content=d.page_content, metadata=d.metadata.copy()) for d in initial_db_docs]
             
-    memory = ConversationBufferMemory(memory_key="history", input_key="question", output_key="ai_response", return_messages=False)
-    prompt = PromptTemplate(input_variables=["history", "context", "question"], template=MEMORY_RAG_PROMPT_TEMPLATE)
-    follow_up_prompt = PromptTemplate(input_variables=["history", "context", "question"], template=MEMORY_RAG_PROMPT_TEMPLATE)
-    rag_chain = None
-    follow_up_chain = None
+            q_thresh = self.session_state.reranker_score_threshold_session_default
+            valid_scores = [d.metadata['relevance_score'] for d in scored_filter_docs if isinstance(d.metadata.get('relevance_score'), (float,int))]
+            if valid_scores:
+                min_s,max_s,avg_s = min(valid_scores),max(valid_scores),(sum(valid_scores)/len(valid_scores) if valid_scores else 0.0)
+                print(f"\n--- Reranker Scores (Initial {actual_retrieved_count} docs) ---\nRange: {min_s:.4f} to {max_s:.4f} (Avg: {avg_s:.4f})")
+                try:
+                    inp = input(f"Threshold? (Default: {q_thresh:.2f}): ").strip()
+                    if inp: q_thresh = float(inp); print(f"Interactive threshold: {q_thresh:.2f}")
+                except ValueError: print("Invalid. Using session default.")
+            elif scored_filter_docs: print("\n[Info] No valid reranker scores for stats/threshold.")
+            else: print("\n[Info] No docs to rerank.")
+            for d in scored_filter_docs:
+                s = d.metadata.get('relevance_score')
+                if isinstance(s,(float,int)) and s >= q_thresh: d.metadata['final_score_used_for_filtering']=s; final_docs.append(d)
+            info_str = f"Reranked: k={k} ({actual_retrieved_count} DB), {len(scored_filter_docs)} scored, Thresh ({q_thresh:.2f}) -> {len(final_docs)} docs"
+        else:
+            sim_docs = self.vector_db.similarity_search_with_relevance_scores(query_text, k=k)
+            actual_retrieved_count = len(sim_docs); q_thresh = self.session_state.base_similarity_threshold_session_default
+            for d, s in sim_docs:
+                if s >= q_thresh: d.metadata['similarity_score']=s; d.metadata['final_score_used_for_filtering']=s; final_docs.append(d)
+            info_str = f"Direct: k={k}, {actual_retrieved_count} DB, Thresh ({q_thresh:.2f}) -> {len(final_docs)} docs"
+        return final_docs, info_str
 
-    if session_mode == "rag" and llm:
-        def _docs_for_rag_chain_lambda(query_text: str) -> List[Document]:
-            # Note: get_final_documents_for_turn will now interactively ask for threshold if reranking
-            docs, _ = get_final_documents_for_turn(
-                query_text, vector_db, 
-                reranker_active_for_session and reranker_model_instance is not None, 
-                param_k_initial_retrieval, 
-                reranker_model_instance, 
-                param_base_similarity_threshold_session_default, # Pass session default
-                param_reranker_score_threshold_session_default    # Pass session default
-            )
-            return docs
+    def invoke_rag_chain_for_turn(self, query: str, docs_for_context: List[Document], is_follow_up: bool) -> str:
+        if not self.session_state.llm_instance: return "Error: LLM not initialized."
+        
+        chain_to_use: Optional[Runnable] = None
+        input_payload: Dict[str, Any] = {"question": query}
 
-        rag_chain = (
-            RunnablePassthrough.assign(retrieved_docs=itemgetter("question") | RunnableLambda(_docs_for_rag_chain_lambda))
-            | RunnablePassthrough.assign(
-                context=RunnableLambda(lambda x: format_docs_for_llm(x.get("retrieved_docs", []))),
-                history=RunnableLambda(lambda x: memory.load_memory_variables({"question": x.get("question", "")}).get("history",""))
-            ) | prompt | llm | StrOutputParser()
-        )
-        print("[*] RAG chain created.")
-        follow_up_chain = ( 
-             RunnablePassthrough.assign(history=RunnableLambda(lambda x: memory.load_memory_variables({"question":x.get("question","")}).get("history","")))
-             | follow_up_prompt | llm | StrOutputParser() 
-        )
-        print("[*] Follow-up chain created.")
+        if is_follow_up:
+            chain_to_use = self.session_state.follow_up_runnable
+            # For follow-up, context is derived from previously stored docs
+            input_payload["context"] = self.format_docs_for_llm(self.session_state.last_retrieved_docs_for_follow_up or []) \
+                                     if self.session_state.last_retrieved_docs_for_follow_up \
+                                     else "No previous documents to use as context. Relying on chat history."
+        else: # New query, use the rag_runnable which expects pre-fetched docs_for_context
+            chain_to_use = self.session_state.rag_runnable
+            input_payload["docs_for_context"] = docs_for_context # Pass retrieved docs
 
-    print("\n" + "="*30 + " Chat Session Started " + "="*30)
-    print(f"Session Mode: {session_mode.replace('_', ' ').title()}")
-    if session_mode == "rag": print(f"LLM Model: {selected_model_name} | Max Tokens: {max_tokens_value}")
+        if not chain_to_use: return "Error: RAG chain not available."
+
+        print(f"\nAI ({self.session_state.selected_llm_name}): ", end="")
+        resp_full = ""
+        try:
+            for chunk in chain_to_use.stream(input_payload): resp_full += chunk; sys.stdout.write(chunk); sys.stdout.flush()
+            print()
+        except Exception as e: print(f"\n[Error] RAG chain exec: {e}"); traceback.print_exc(); resp_full = f"(LLM Error: {type(e).__name__})"
+        
+        final_resp = resp_full.strip() or "(Empty LLM response)"
+        self.session_state.memory.save_context({"question": query}, {"ai_response": final_resp})
+        return final_resp
+        
+# --- Command Handler Class ---
+class CommandHandler:
+    def __init__(self, ss: SessionState, rm: RAGManager, cfg: ScriptConfig): self.state, self.manager, self.config = ss, rm, cfg
+    def handle_command(self, inp: str) -> bool: 
+        pts = inp.split(maxsplit=1); cmd, args = pts[0].lower(), (pts[1] if len(pts)>1 else None)
+        if cmd=="/help": self._show_help()
+        elif cmd=="/mode": self._toggle_mode()
+        elif cmd=="/showchunks": self._toggle_show_chunks()
+        elif cmd=="/set_tokens": self._set_tokens(args)
+        elif cmd=="/set_rerank_threshold": self._set_rerank_thresh(args)
+        elif cmd=="/set_base_threshold": self._set_base_sim_thresh(args)
+        else: print(f"Unknown cmd: {cmd}. /help for options.")
+        return True 
+    def _show_help(self): print(f"\nCmds: /help, /mode, /showchunks, /set_tokens <N>, /set_rerank_threshold <f>, /set_base_threshold <0.0-1.0>, {', '.join(self.config.EXIT_KEYWORDS)}")
+    def _toggle_mode(self):
+        self.state.mode = "retrieval_only" if self.state.mode=="rag" else "rag"; print(f"Mode: {self.state.mode.replace('_',' ').title()}")
+        if self.state.mode=="rag" and not self.state.llm_instance and self.state.selected_llm_name:
+            print(f"Re-init LLM ({self.state.selected_llm_name})..."); self.manager._initialize_llm_and_chains()
+        elif self.state.mode=="rag" and not self.state.selected_llm_name: print("No LLM selected for RAG.")
+    def _toggle_show_chunks(self): self.state.show_chunks_in_terminal = not self.state.show_chunks_in_terminal; print(f"Show chunks: {'ON' if self.state.show_chunks_in_terminal else 'OFF'}")
+    def _set_tokens(self, args: Optional[str]):
+        if self.state.mode!="rag" or not self.state.llm_instance: print("RAG mode & LLM needed."); return
+        try:
+            val_s = args or input(f"Tokens (now: {self.state.max_tokens}, >50): ").strip()
+            if not val_s: raise ValueError("No input.")
+            new_v = int(val_s)
+            if new_v>50: self.state.max_tokens=new_v; print(f"Tokens: {new_v}. Re-init LLM..."); self.manager._initialize_llm_and_chains()
+            else: print("Must be > 50.")
+        except (ValueError,TypeError) as e: print(f"Invalid. Usage: /set_tokens <num>. Error: {e}")
+    def _set_rerank_thresh(self, args: Optional[str]):
+        if not RERANKING_COMPONENT_AVAILABLE: print("Re-ranking N/A."); return
+        try:
+            val_s = args or input(f"Session Default Rerank Thresh (now: {self.state.reranker_score_threshold_session_default:.2f}): ").strip()
+            if not val_s: raise ValueError("No input.")
+            self.state.reranker_score_threshold_session_default = float(val_s)
+            print(f"Session Default Rerank Thresh: {self.state.reranker_score_threshold_session_default:.2f}")
+            if not self.state.reranker_active_for_session: print("Note: Re-ranking not active.")
+        except (ValueError,TypeError) as e: print(f"Invalid. Usage: /set_rerank_threshold <f>. Error: {e}")
+    def _set_base_sim_thresh(self, args: Optional[str]):
+        try:
+            val_s = args or input(f"Session Default Sim Thresh (now: {self.state.base_similarity_threshold_session_default:.2f}, 0-1): ").strip()
+            if not val_s: raise ValueError("No input.")
+            new_v = float(val_s)
+            if 0.0<=new_v<=1.0: self.state.base_similarity_threshold_session_default=new_v; print(f"Session Default Sim Thresh: {new_v:.2f}"); (print("Note: Used when re-ranking OFF.") if self.state.reranker_active_for_session else None)
+            else: print("Must be 0.0-1.0.")
+        except (ValueError,TypeError) as e: print(f"Invalid. Usage: /set_base_threshold <f_0_to_1>. Error: {e}")
+
+# --- Initial Setup Prompts ---
+def initial_user_setup(ss: SessionState, cfg: ScriptConfig) -> bool:
+    print("\n--- Initial Session Setup ---")
+    mode_in = input(f"Mode (1.RAG, 2.RetrieveOnly) [Enter for {ss.mode}]: ").strip()
+    ss.mode = {"1":"rag","2":"retrieval_only"}.get(mode_in, ss.mode); print(f"[*] Mode: {ss.mode.replace('_',' ').title()}")
+    show_in = input(f"Show chunks? (Y/n) [Enter for {'Y' if ss.show_chunks_in_terminal else 'N'}]: ").strip().lower()
+    ss.show_chunks_in_terminal = not(show_in=='n'); print(f"[*] Show chunks: {'ON' if ss.show_chunks_in_terminal else 'OFF'}")
+
+    if ss.mode == "rag":
+        print("\n--- Select LLM Model ---")
+        if not cfg.AVAILABLE_MODELS: print("[Error] No LLMs in config."); return False
+        def_llm = cfg.AVAILABLE_MODELS[0]; print("Available (from script config):")
+        for i,n in enumerate(cfg.AVAILABLE_MODELS): print(f"  {i+1}. {n}")
+        while True:
+            llm_in = input(f"LLM (1-{len(cfg.AVAILABLE_MODELS)}) or name [Enter for '{def_llm}']: ").strip()
+            tmp_n = def_llm if not llm_in else llm_in
+            if llm_in.isdigit():
+                try: tmp_n = cfg.AVAILABLE_MODELS[int(llm_in)-1]
+                except (ValueError,IndexError): print("Invalid num."); continue
+            if tmp_n and check_ollama_connection(tmp_n): ss.selected_llm_name = tmp_n; break
+        print(f"[*] Selected LLM: {ss.selected_llm_name}")
+        while True:
+            tok_in = input(f"Max LLM tokens? [Enter for {ss.max_tokens}]: ").strip()
+            if not tok_in: break
+            try: v=int(tok_in); ss.max_tokens=v if v>50 else 50; break
+            except ValueError: print("Invalid num.")
+        print(f"[*] LLM max tokens: {ss.max_tokens}")
+
+    ss.reranker_active_for_session = RERANKING_COMPONENT_AVAILABLE and not (input(f"Enable Re-ranking? (Y/n) [Enter for {'Y' if ss.reranker_active_for_session else 'N'}]: ").strip().lower() == 'n') if RERANKING_COMPONENT_AVAILABLE else False
+    print(f"[*] Re-ranking: {'ON' if ss.reranker_active_for_session else 'OFF'}")
     
-    if reranker_active_for_session and reranker_model_instance:
-        print(f"Re-ranking: ENABLED (Initial k for DB fetch={param_k_initial_retrieval}, SESSION DEFAULT Score Threshold >={param_reranker_score_threshold_session_default:.2f})")
-        print("INFO: For each query, you'll be shown score stats and prompted for a per-query threshold.")
-    else:
-        print(f"Re-ranking: DISABLED (Direct Retrieve Max k from DB={param_k_initial_retrieval}, SESSION DEFAULT Similarity Threshold >={param_base_similarity_threshold_session_default:.2f})")
+    if ss.reranker_active_for_session:
+        def_k_re = cfg.DEFAULT_INITIAL_CANDIDATES_FOR_RERANKER
+        while True: 
+            k_in = input(f"Initial k for reranker? [Enter for {def_k_re}]: ").strip()
+            if not k_in: ss.k_initial_retrieval = def_k_re; break
+            try: v=int(k_in); ss.k_initial_retrieval=v if v>0 else def_k_re; break
+            except ValueError: print("Invalid num.")
+        print(f"[*] Initial k for reranker: {ss.k_initial_retrieval}")
+        def_t_re = cfg.DEFAULT_RELEVANCE_SCORE_THRESHOLD_RERANKER
+        while True: 
+            t_in = input(f"Session Default Rerank Threshold? [Enter for {def_t_re:.2f}]: ").strip()
+            if not t_in: ss.reranker_score_threshold_session_default = def_t_re; break
+            try: ss.reranker_score_threshold_session_default = float(t_in); break
+            except ValueError: print("Invalid float.")
+        print(f"[*] Session Default Rerank Threshold: {ss.reranker_score_threshold_session_default:.2f}")
+    else: 
+        def_k_dir = cfg.DEFAULT_K_FOR_DIRECT_RETRIEVAL; ss.k_initial_retrieval = def_k_dir
+        while True: 
+            k_in = input(f"Max k for direct retrieval? [Enter for {ss.k_initial_retrieval}]: ").strip()
+            if not k_in: break
+            try: v=int(k_in); ss.k_initial_retrieval=v if v>0 else def_k_dir; break
+            except ValueError: print("Invalid num.")
+        print(f"[*] Max k for direct retrieval: {ss.k_initial_retrieval}")
+        def_t_dir = cfg.DEFAULT_BASE_SIMILARITY_THRESHOLD
+        while True: 
+            t_in = input(f"Session Default Sim Threshold (0-1)? [Enter for {def_t_dir:.2f}]: ").strip()
+            if not t_in: ss.base_similarity_threshold_session_default = def_t_dir; break
+            try: v=float(t_in); ss.base_similarity_threshold_session_default=(v if 0.0<=v<=1.0 else def_t_dir); break
+            except ValueError: print("Invalid float.")
+        print(f"[*] Session Default Sim Threshold: {ss.base_similarity_threshold_session_default:.2f}")
+    return True
 
-    print(f"Show Chunks in Terminal: {'ENABLED' if show_chunks_in_terminal else 'DISABLED'}")
-    print(f"Type '/help' for commands, '{', '.join(EXIT_KEYWORDS)}' to end.")
-    print("="* (62 + len(" Chat Session Started ") -2)) 
+# --- Main Application Logic ---
+def main():
+    parser = argparse.ArgumentParser(description="Refactored RAG Chat Application")
+    parser.add_argument("--db_dir", default=None); parser.add_argument("--output_dir", default=None)
+    cli_args = parser.parse_args()
+    config = ScriptConfig(db_dir_override=cli_args.db_dir, output_dir_override=cli_args.output_dir)
+    session = SessionState(config)
+    if not initial_user_setup(session, config): sys.exit(1)
+    rag_manager = RAGManager(config, session) 
+    command_handler = CommandHandler(session, rag_manager, config)
 
-    conversation_log = []
-    turn_count = 0
-    last_final_docs_for_follow_up: Optional[List[Document]] = None
+    print("\n" + "="*30 + " Chat Session Started " + "="*30) 
+    print(f"Mode: {session.mode.replace('_', ' ').title()}")
+    if session.mode=="rag" and session.selected_llm_name: print(f"LLM: {session.selected_llm_name} | Max Tokens: {session.max_tokens}")
+    if session.reranker_active_for_session: print(f"Rerank: ON (k={session.k_initial_retrieval}, Default Thresh >={session.reranker_score_threshold_session_default:.2f})")
+    else: print(f"Rerank: OFF (Direct k={session.k_initial_retrieval}, Default Thresh >={session.base_similarity_threshold_session_default:.2f})")
+    print(f"Show Chunks: {'ON' if session.show_chunks_in_terminal else 'OFF'}")
+    print(f"'/help' or exit with: {', '.join(config.EXIT_KEYWORDS)}")
+    print("=" * (len(" Chat Session Started ") + 60))
 
     try:
         while True:
-            turn_count += 1; is_follow_up = False
-            if turn_count > 1 and session_mode == "rag" and last_final_docs_for_follow_up and llm:
-                _choice = input("Follow-up on last context? (y/n, Enter=n): ").strip().lower()
-                if _choice == 'y': is_follow_up = True; print("[Using previous context]")
+            session.turn_count += 1; is_follow_up = False
+            if session.turn_count > 1 and session.mode=="rag" and session.last_retrieved_docs_for_follow_up and session.llm_instance:
+                if input("Follow-up? (y/n) [n]: ").strip().lower() == 'y': is_follow_up=True; print("[Using previous context]")
+            
+            user_q = input(f"\n[{session.turn_count}] You: ").strip()
+            if not user_q: session.turn_count-=1; continue
+            if user_q.lower() in config.EXIT_KEYWORDS: print("\nExiting..."); break
+            if user_q.startswith('/'): command_handler.handle_command(user_q); session.turn_count-=1; continue
 
-            user_input = input(f"\n[{turn_count}] You: ").strip()
-            if not user_input: turn_count -= 1; continue 
-            if user_input.lower() in EXIT_KEYWORDS: print("\nExiting..."); break
-
-            if user_input.startswith('/'):
-                parts = user_input.split(); cmd = parts[0].lower(); 
-                arg1_str = parts[1] if len(parts) > 1 else None
-                
-                if cmd == "/help":
-                     print("\nAvailable commands:")
-                     print("  /mode              : Toggle RAG/Retrieval Only.")
-                     print("  /showchunks        : Toggle display of retrieved chunk details.")
-                     print("  /set_tokens <N>    : Change AI response token limit (RAG mode only).")
-                     print("  /set_rerank_threshold <float>: Change SESSION DEFAULT score threshold for re-ranked docs.")
-                     print("                           (Note: You'll be prompted per query if reranking is on).")
-                     print("  /set_base_threshold <0.0-1.0>: Change SESSION DEFAULT similarity threshold for direct retrieval.")
-                     print(f"  {', '.join(EXIT_KEYWORDS)} : Exit.")
-                elif cmd == "/set_rerank_threshold": # Sets the SESSION DEFAULT
-                    if RERANKING_AVAILABLE : # Check if reranking could even be active
-                        try:
-                            if arg1_str is None: raise ValueError("Missing threshold value.")
-                            param_reranker_score_threshold_session_default = float(arg1_str)
-                            print(f"SESSION DEFAULT rerank threshold set to {param_reranker_score_threshold_session_default:.2f}")
-                            if not (reranker_active_for_session and reranker_model_instance):
-                                print("Note: Re-ranking is not currently active. This default will apply if it's enabled.")
-                        except ValueError as e: print(f"Usage: /set_rerank_threshold <float_value>. Error: {e}")
-                    else: print("Re-ranking components are not available in this environment.")
-                elif cmd == "/set_base_threshold": # Sets the SESSION DEFAULT
-                    try:
-                        if arg1_str is None: raise ValueError("Missing threshold value.")
-                        val = float(arg1_str)
-                        if 0.0 <= val <= 1.0: 
-                            param_base_similarity_threshold_session_default = val
-                            print(f"SESSION DEFAULT base similarity threshold set to {param_base_similarity_threshold_session_default:.2f}")
-                            if reranker_active_for_session and reranker_model_instance:
-                                print("Note: Direct retrieval threshold is not used when re-ranking is active.")
-                        else: print("Base threshold must be between 0.0 and 1.0.")
-                    except ValueError as e: print(f"Usage: /set_base_threshold <float_value_0_to_1>. Error: {e}")
-                elif cmd == "/mode":
-                     session_mode = "retrieval_only" if session_mode == "rag" else "rag"
-                     print(f"Switched to {session_mode.replace('_', ' ').title()} mode.")
-                     if session_mode == "rag" and not llm and selected_model_name: 
-                         llm = initialize_llm(selected_model_name, max_tokens_value)
-                         if not llm: print("[Warning] LLM re-init failed.")
-                         if llm: 
-                            def _docs_for_rag_chain_lambda_rebuild(query_text: str) -> List[Document]:
-                                docs, _ = get_final_documents_for_turn(query_text, vector_db, reranker_active_for_session and reranker_model_instance is not None, param_k_initial_retrieval, reranker_model_instance, param_base_similarity_threshold_session_default, param_reranker_score_threshold_session_default)
-                                return docs
-                            rag_chain = ( RunnablePassthrough.assign(retrieved_docs=itemgetter("question") | RunnableLambda(_docs_for_rag_chain_lambda_rebuild)) | RunnablePassthrough.assign( context=RunnableLambda(lambda x: format_docs_for_llm(x.get("retrieved_docs", []))), history=RunnableLambda(lambda x: memory.load_memory_variables({"question": x.get("question", "")}).get("history",""))) | prompt | llm | StrOutputParser())
-                            follow_up_chain = ( RunnablePassthrough.assign(history=RunnableLambda(lambda x: memory.load_memory_variables({"question":x.get("question","")}).get("history",""))) | follow_up_prompt | llm | StrOutputParser())
-                            print("[*] RAG chain (re-)created.")
-                elif cmd == "/showchunks":
-                     show_chunks_in_terminal = not show_chunks_in_terminal
-                     print(f"Chunk display in terminal: {'ENABLED' if show_chunks_in_terminal else 'DISABLED'}")
-                elif cmd == "/set_tokens":
-                     if session_mode != "rag": print("Token limit only applicable in RAG mode.")
-                     elif not llm or not selected_model_name : print("LLM not initialized.")
-                     else:
-                         print(f"Current max tokens: {max_tokens_value}")
-                         try:
-                             new_limit_str = arg1_str if arg1_str else input("Enter new max token limit (> 50): ").strip()
-                             if not new_limit_str: raise ValueError("No token limit provided.")
-                             new_limit = int(new_limit_str)
-                             if new_limit > 50:
-                                 new_llm_instance = initialize_llm(selected_model_name, new_limit) 
-                                 if new_llm_instance: 
-                                     llm = new_llm_instance 
-                                     max_tokens_value = new_limit
-                                     def _docs_for_rag_chain_lambda_retoken(query_text: str) -> List[Document]:
-                                         docs, _ = get_final_documents_for_turn(query_text, vector_db, reranker_active_for_session and reranker_model_instance is not None, param_k_initial_retrieval, reranker_model_instance, param_base_similarity_threshold_session_default, param_reranker_score_threshold_session_default)
-                                         return docs
-                                     rag_chain = ( RunnablePassthrough.assign(retrieved_docs=itemgetter("question") | RunnableLambda(_docs_for_rag_chain_lambda_retoken)) | RunnablePassthrough.assign( context=RunnableLambda(lambda x: format_docs_for_llm(x.get("retrieved_docs", []))), history=RunnableLambda(lambda x: memory.load_memory_variables({"question": x.get("question", "")}).get("history",""))) | prompt | llm | StrOutputParser())
-                                     follow_up_chain = ( RunnablePassthrough.assign(history=RunnableLambda(lambda x: memory.load_memory_variables({"question":x.get("question","")}).get("history",""))) | follow_up_prompt | llm | StrOutputParser())
-                                     print(f"Max tokens set to {max_tokens_value}. RAG chain updated.")
-                                 else: print("Failed to update token limit (LLM re-initialization error).")
-                             else: print("Value must be > 50.")
-                         except (TypeError, ValueError) as e: print(f"Invalid number. Usage: /set_tokens <number>. Error: {e}")
-                else: print(f"Unknown command: {cmd}")
-                turn_count -=1; continue
-
-            current_turn_final_docs: List[Document] = []
-            log_status = "N/A"; display_info = ""
-
-            if not is_follow_up:
+            final_docs_turn, retrieve_info, retrieve_log_status = [], "N/A", "N/A"
+            
+            if not is_follow_up: # For new queries, always retrieve
                 print("Retrieving context...")
                 try:
-                    # Pass the SESSION DEFAULT thresholds to the function
-                    # The function will use them as defaults if interactive prompt is used
-                    current_turn_final_docs, display_info = get_final_documents_for_turn( 
-                        user_input, vector_db,
-                        reranker_active_for_session and reranker_model_instance is not None,
-                        param_k_initial_retrieval,
-                        reranker_model_instance,
-                        param_base_similarity_threshold_session_default, 
-                        param_reranker_score_threshold_session_default 
-                    )
-                    last_final_docs_for_follow_up = current_turn_final_docs 
-                    log_status = f"Success ({len(current_turn_final_docs)} final docs)"
-                except Exception as e:
-                    print(f"\n[Error] Retrieval failed: {e}"); traceback.print_exc()
-                    current_turn_final_docs = []; log_status = f"Error: {type(e).__name__}"
-            else: 
-                current_turn_final_docs = last_final_docs_for_follow_up if last_final_docs_for_follow_up else []
-                if current_turn_final_docs: 
-                    doc_count = len(current_turn_final_docs)
-                    # display_info for follow-up might need to reflect the threshold used for those docs
-                    # For now, keeping it simple
-                    if reranker_active_for_session and reranker_model_instance:
-                         display_info = f"Using previous context ({doc_count} docs)"
-                    else:
-                         display_info = f"Using previous context ({doc_count} docs)"
-                else:
-                    display_info = "Using previous context (none available)"
-                log_status = "Success (Used Previous Context)" if current_turn_final_docs else "Failed (No Previous Context)"
+                    final_docs_turn, retrieve_info = rag_manager.get_final_documents_for_turn(user_q)
+                    session.last_retrieved_docs_for_follow_up = final_docs_turn # Store for potential follow-up
+                    retrieve_log_status = f"Success ({len(final_docs_turn)} docs)"
+                except Exception as e: print(f"\n[Error] Retrieval failed: {e}"); traceback.print_exc(); retrieve_log_status = f"Error: {type(e).__name__}"
+            else: # For follow-up, use previously stored docs
+                final_docs_turn = session.last_retrieved_docs_for_follow_up or []
+                retrieve_info = f"Using previous context ({len(final_docs_turn)} docs)"
+                retrieve_log_status = "Success (Used Previous)" if final_docs_turn else "Failed (No Previous Context)"
+            
+            if session.show_chunks_in_terminal: display_retrieved_docs(user_q, final_docs_turn, retrieve_info)
+            else: print(f"[*] Retrieved {len(final_docs_turn)} docs ({retrieve_info}, Display OFF).")
 
+            ai_resp_log = "N/A (Retrieval Only or Error)"
+            if session.mode == "rag":
+                ai_resp_log = rag_manager.invoke_rag_chain_for_turn(user_q, final_docs_turn, is_follow_up) # Pass docs here
 
-            if show_chunks_in_terminal:
-                display_retrieved_docs(user_input, current_turn_final_docs, display_info)
-            else:
-                print(f"[*] Retrieved {len(current_turn_final_docs)} final docs ({display_info}, Display disabled).")
-
-            context_details_log = []
-            if current_turn_final_docs:
-                for i, doc in enumerate(current_turn_final_docs):
-                    s_meta = {} 
-                    for k_meta, v_meta in doc.metadata.items():
-                        if isinstance(v_meta, (dict,list,set)): 
-                            try: s_meta[k_meta] = json.dumps(v_meta) 
-                            except TypeError: s_meta[k_meta] = str(v_meta) 
-                        else: s_meta[k_meta] = v_meta
-                    score = doc.metadata.get('final_score_used_for_filtering') 
-                    if score is not None: s_meta['logged_score'] = float(score) if isinstance(score, (float, int, np.floating, np.integer)) else str(score)
-                    context_details_log.append({'idx':i+1, 'content':doc.page_content, 'metadata':s_meta})
-
-            ai_response = "N/A (Retrieval Only or LLM Error)"
-            if session_mode == "rag":
-                if not llm: ai_response = "Error: LLM not initialized."
-                elif not current_turn_final_docs and not is_follow_up : ai_response = "Error: No context after filtering for LLM." 
-                elif not current_turn_final_docs and is_follow_up and not last_final_docs_for_follow_up: ai_response = "Error: No previous context for follow-up."
-                else:
-                    print(f"\nAI ({selected_model_name}): ", end="")
-                    full_resp = ""
-                    try:
-                        chain_input = {"question": user_input}
-                        active_chain = rag_chain
-                        if is_follow_up:
-                             if last_final_docs_for_follow_up: 
-                                chain_input["context"] = format_docs_for_llm(last_final_docs_for_follow_up) 
-                                active_chain = follow_up_chain 
-                             else: 
-                                active_chain = None 
-                                full_resp = "(Cannot follow-up, no previous context available)"
-                                print(full_resp)
-
-                        if active_chain: 
-                            for chunk_resp in active_chain.stream(chain_input):
-                                sys.stdout.write(chunk_resp); sys.stdout.flush(); full_resp += chunk_resp
-                    except Exception as e: print(f"\n[Error in RAG chain]: {e}"); traceback.print_exc(); full_resp = "(LLM Error)"
-                    print(); ai_response = full_resp if full_resp.strip() else "(Empty LLM response)"
-                    if llm and (not is_follow_up or (is_follow_up and last_final_docs_for_follow_up)): 
-                         memory.save_context({"question": user_input}, {"ai_response": ai_response})
-
-            conversation_log.append({
-                "turn": turn_count, "mode": session_mode, "is_follow_up": is_follow_up,
-                "input": user_input, "retrieval_status": log_status, "retrieval_info_str": display_info,
-                "docs_count": len(context_details_log), "docs_details": context_details_log,
-                "ai_response": ai_response
+            log_docs_details = []
+            if final_docs_turn:
+                for i,d in enumerate(final_docs_turn):
+                    meta = {k:(json.dumps(v) if isinstance(v,(dict,list,set,tuple)) else str(v) if not isinstance(v,(str,int,float,bool,type(None))) else v) for k,v in d.metadata.items()}
+                    log_docs_details.append({"idx":i+1,"content":d.page_content,"metadata":meta})
+            session.conversation_log.append({
+                "turn":session.turn_count, "mode":session.mode, "is_follow_up":is_follow_up, "input":user_q, 
+                "retrieval_status":retrieve_log_status, "retrieval_info":retrieve_info,
+                "docs_count":len(log_docs_details), "docs_details":log_docs_details, "ai_response":ai_resp_log
             })
-    except (EOFError, KeyboardInterrupt): print("\n\nUser interrupted.")
+    except (EOFError,KeyboardInterrupt): print("\n\nUser interrupted.")
     except Exception as e: print(f"\n--- Error in main loop: {e} ---"); traceback.print_exc()
     finally: 
-        if conversation_log:
-            try:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_file = os.path.join(OUTPUT_DIR, f"{OUTPUT_FILE_PREFIX}_{ts}.json")
-                summary = {
-                    "start_time": ts, "mode": session_mode, "llm_used":selected_model_name,
-                    "reranker_active_and_available": reranker_active_for_session and reranker_model_instance is not None,
-                    "k_initial_retrieval_for_session": param_k_initial_retrieval, 
-                    "reranker_score_threshold_session_default_if_active": param_reranker_score_threshold_session_default if reranker_active_for_session and reranker_model_instance else "N/A",
-                    "base_similarity_threshold_session_default_if_direct": param_base_similarity_threshold_session_default if not (reranker_active_for_session and reranker_model_instance) else "N/A",
-                    "db_path": os.path.abspath(DB_DIR), "total_turns": len(conversation_log)
-                }
-                with open(log_file, 'w', encoding='utf-8') as f:
-                    json.dump({"summary":summary, "turns":conversation_log}, f, indent=4, default=str)
-                print(f"\n[*] Log saved to {log_file}")
-            except Exception as e: print(f"\n[Error saving log]: {e}")
-        else: print("\n[*] No turns to log.")
+        print("\nSaving log...")
+        save_chat_log(session, rag_manager, config) 
         print("\nChat session finished.")
+
+if __name__ == "__main__":
+    main()
